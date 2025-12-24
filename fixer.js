@@ -1,24 +1,21 @@
 (() => {
   
   // Configuration
-  const PROBE_TIMEOUT = 5000; 
-  const MAX_ATTEMPTS = 30;
-  const MAX_SERVER_NUM = 15;
+  const PROBE_TIMEOUT = 3000;  // 3 seconds - if it doesn't load by then, it's likely down
+  const MAX_ATTEMPTS = 15;     // Try up to 15 'n' servers
+  const MAX_SERVER_NUM = 15;   // Iterate through server numbers 00-15
   const RETRY_DELAY = 1000; 
   
-  const FALLBACK_PREFIXES = ['n', 'x', 't', 's', 'w', 'm', 'c', 'u', 'k'];
+  // ROOTS to fallback to (subdomain.ROOT.tld)
   const FALLBACK_ROOTS = ['mbdny.org', 'mbrtz.org', 'bato.to', 'mbwbm.org', 'mbznp.org', 'mbqgu.org'];
   
   const SUBDOMAIN_RE = /^https?:\/\/([a-z]+)(\d{1,3})\.([a-z0-9\-]+)\.(org|net|to)(\/.*)$/i;
   
-  
-  const serverCache = new Map();
-  const failedCache = new Set(); 
-  
-  
+  const serverCache = new Map(); // Remembers working servers per root
+  const failedCache = new Set(); // Remembers dead URLs
   const processingImages = new WeakSet();
 
-  // 1. Parse URL
+  // 1. Parse URL structure
   function parseSubdomain(src) {
     const m = src.match(SUBDOMAIN_RE);
     if (!m) return null;
@@ -31,10 +28,10 @@
     };
   }
 
-  // 2. Probe a URL 
+  // 2. Test if a URL works
   function probeUrl(url, timeout = PROBE_TIMEOUT) {
     return new Promise((resolve, reject) => {
-      // Check failed cache first
+      // Check simple cache first
       const cacheKey = url.split('/').slice(0, 3).join('/');
       if (failedCache.has(cacheKey)) {
         reject('cached-fail');
@@ -55,6 +52,7 @@
       img.onload = () => {
         if (!timedOut) {
           clearTimeout(t);
+          // Simple validation: tiny images are usually error placeholders
           if (img.width > 1 || img.height > 1) {
             resolve(true);
           } else {
@@ -76,64 +74,52 @@
     });
   }
 
-  // 3. Generate candidate URLs with smart prioritization
+  // 3. Generate candidate URLs (STRICTLY K AND N ONLY)
   function generateCandidates(parsed) {
     const candidates = [];
     const pathKey = parsed.path.split('/').slice(0, 3).join('/'); 
     
     const add = (p, n, r, t, priority = 1) => {
+      // STRICT FILTER: If it is not 'k' or 'n', do not attempt it.
+      if (p !== 'k' && p !== 'n') return;
+      
       const url = `https://${p}${String(n).padStart(2, '0')}.${r}.${t}${parsed.path}`;
       candidates.push({ url, priority });
     };
 
-    // Priority 0: Check cache for known working patterns
+    // Priority 0: Check success cache
     const cacheKey = `${parsed.root}-${pathKey}`;
     if (serverCache.has(cacheKey)) {
       const cached = serverCache.get(cacheKey);
       add(cached.prefix, cached.number, cached.root, cached.tld, 0);
     }
 
-    // Priority 1: Quick k→n fix (most common issue)
+    // Priority 1: Instant Prefix Swap (The most likely fix)
     if (parsed.prefix === 'k') {
+      // If currently K, try N immediately
       add('n', parsed.number, parsed.root, parsed.tld, 1);
-      add('x', parsed.number, parsed.root, parsed.tld, 1);
-      add('t', parsed.number, parsed.root, parsed.tld, 1);
+    } else {
+      // If currently N, try K (just in case)
+      add('k', parsed.number, parsed.root, parsed.tld, 1);
     }
 
-    // Priority 2: Try other common prefixes
-    FALLBACK_PREFIXES.forEach(letter => {
-      if (letter !== parsed.prefix && letter !== 'k' && letter !== 'n') {
-        add(letter, parsed.number, parsed.root, parsed.tld, 2);
-      }
-    });
-
-    // Priority 3: Try same prefix with different numbers (for load balancing issues)
-    for (let i = 0; i <= Math.min(5, MAX_SERVER_NUM); i++) {
+    // Priority 2: Load Balancing on the 'n' server
+    // (Since 'k' is down, we prioritize trying 'n' with different numbers)
+    for (let i = 0; i <= MAX_SERVER_NUM; i++) {
       if (i !== parsed.number) {
-        add(parsed.prefix, i, parsed.root, parsed.tld, 3);
+        add('n', i, parsed.root, parsed.tld, 2);
       }
     }
 
-    // Priority 4: Try different root domains
+    // Priority 3: Fallback roots
+    // If the domain itself is blocked, try alternate mirrors with 'n'
     FALLBACK_ROOTS.forEach(root => {
       const parts = root.split('.');
       if (parts.length === 2 && parts[0] !== parsed.root) {
-        add(parsed.prefix, parsed.number, parts[0], parts[1], 4);
-        // Also try n prefix with different roots
-        if (parsed.prefix === 'k') {
-          add('n', parsed.number, parts[0], parts[1], 4);
-        }
+        add('n', parsed.number, parts[0], parts[1], 4);
       }
     });
 
-    // Priority 5: More aggressive number changes
-    for (let i = 6; i <= MAX_SERVER_NUM; i++) {
-      if (i !== parsed.number) {
-        add(parsed.prefix, i, parsed.root, parsed.tld, 5);
-      }
-    }
-
-    // Sort by priority and deduplicate
     const sorted = candidates
       .sort((a, b) => a.priority - b.priority)
       .map(c => c.url);
@@ -141,26 +127,19 @@
     return [...new Set(sorted)].slice(0, MAX_ATTEMPTS);
   }
 
-  // 4. Rewrite srcset attributes
+  // 4. Update srcset for responsiveness
   function rewriteSrcset(srcset, workingUrl) {
     if (!srcset) return null;
-    
     const workingParsed = parseSubdomain(workingUrl);
     if (!workingParsed) return null;
-    
     const newBase = `https://${workingParsed.prefix}${String(workingParsed.number).padStart(2, '0')}.${workingParsed.root}.${workingParsed.tld}`;
-    
     return srcset.replace(/https?:\/\/[a-z]+\d{1,3}\.[a-z0-9\-]+\.(org|net|to)/gi, newBase);
   }
-
   
   async function fixImage(img, isRetry = false) {
-    // Skip if already being processed
+    // Prevent duplicate processing
     if (processingImages.has(img)) return;
-    
-    // Check if already fixed or being fixed
-    if (img.dataset.batoFixing === "done" || 
-        (img.dataset.batoFixing === "true" && !isRetry)) return;
+    if (img.dataset.batoFixing === "done" || (img.dataset.batoFixing === "true" && !isRetry)) return;
     
     processingImages.add(img);
     img.dataset.batoFixing = "true";
@@ -174,20 +153,18 @@
     const candidates = generateCandidates(parsed);
     let lastError = null;
 
-    
+    // Iterate through candidates
     for (let i = 0; i < candidates.length; i++) {
       const url = candidates[i];
-      
-      // Skip if we already know this server pattern fails
       const serverPattern = url.split('/').slice(0, 3).join('/');
+      
+      // Skip if this server cluster is known to be dead
       if (failedCache.has(serverPattern)) continue;
       
       try {
+        await probeUrl(url, PROBE_TIMEOUT);
         
-        const timeout = PROBE_TIMEOUT + (i > 5 ? 1000 : 0);
-        await probeUrl(url, timeout);
-        
-        //Cache the working server pattern
+        // Success: Cache this server config
         const successParsed = parseSubdomain(url);
         if (successParsed) {
           const pathKey = parsed.path.split('/').slice(0, 3).join('/');
@@ -200,11 +177,10 @@
           });
         }
         
-        // Apply the fix
+        // Apply changes
         img.referrerPolicy = "no-referrer";
         img.src = url;
         
-        // Update srcset if it exists
         if (img.srcset) {
           const newSrcset = rewriteSrcset(img.srcset, url);
           if (newSrcset) img.srcset = newSrcset;
@@ -217,19 +193,18 @@
         
       } catch (e) {
         lastError = e;
-        if (e === 'timeout' && i > 10) {
-          break;
-        }
+        // Optimization: If the first few 'n' servers fail due to timeout, 
+        // network might be the issue, stop early.
+        if (e === 'timeout' && i > 6) break;
       }
     }
     
-    // 
+    // Failure handling
     if (!isRetry && lastError === 'timeout') {
       img.dataset.batoFixing = "retry";
       processingImages.delete(img);
       
       setTimeout(() => {
-        // Check if image is still broken before retrying
         if (img.complete && img.naturalWidth === 0) {
           fixImage(img, true);
         }
@@ -240,23 +215,23 @@
     }
   }
 
-  // 6. Quick preemptive fix for known problematic servers
+  // 6. Fast Fix: Swaps 'k' to 'n' without checking connectivity first
   function preemptiveFix(img) {
     const parsed = parseSubdomain(img.src);
     if (!parsed) return false;
     
-    // Only preemptively fix k servers (most common issue)
+    // Logic: If 'k', switch to 'n'. Ignore everything else.
     if (parsed.prefix !== 'k') return false;
     
-    // Check cache first
     const pathKey = parsed.path.split('/').slice(0, 3).join('/');
     const cacheKey = `${parsed.root}-${pathKey}`;
     
-    let newPrefix = 'n'; // Default k→n fix
+    let newPrefix = 'n'; 
     let newNumber = parsed.number;
     let newRoot = parsed.root;
     let newTld = parsed.tld;
     
+    // Use cached working server if available
     if (serverCache.has(cacheKey)) {
       const cached = serverCache.get(cacheKey);
       newPrefix = cached.prefix;
@@ -265,8 +240,12 @@
       newTld = cached.tld;
     }
     
+    // STRICT GUARD: Ensure we don't accidentally produce an 'x' or 't' url from old cache
+    if (newPrefix !== 'k' && newPrefix !== 'n') newPrefix = 'n';
+
     const newUrl = `https://${newPrefix}${String(newNumber).padStart(2, '0')}.${newRoot}.${newTld}${parsed.path}`;
     
+    // Save original to revert if this fix fails
     img.dataset.originalSrc = img.src;
     img.referrerPolicy = "no-referrer";
     img.src = newUrl;
@@ -281,69 +260,63 @@
     return true;
   }
 
-  // 7. Check if image needs fixing
+  // 7. Verify the preemptive fix
   function checkImage(img) {
-    // For images that were preemptively fixed, verify they loaded
+    // If preemptive fix failed (still broken), try the full search (fixImage)
     if (img.dataset.batoPreemptive === "true" && img.complete && img.naturalWidth === 0) {
-      // Preemptive fix failed, restore original and try full fix
       if (img.dataset.originalSrc) {
-        img.src = img.dataset.originalSrc;
-        if (img.dataset.originalSrcset) {
-          img.srcset = img.dataset.originalSrcset;
-        }
+        img.src = img.dataset.originalSrc; // Revert
+        if (img.dataset.originalSrcset) img.srcset = img.dataset.originalSrcset;
       }
       img.dataset.batoPreemptive = "failed";
       fixImage(img);
       return;
     }
     
-    // Check if image is broken
+    // Standard check for broken images
     if (img.complete && img.naturalWidth === 0 && img.dataset.batoFixing !== "done") {
       fixImage(img);
     }
   }
 
-  // 8. Process new image
+  // 8. Handle new images added to DOM
   function processNewImage(img) {
-    // Try preemptive fix for k servers
     const parsed = parseSubdomain(img.src);
+    
+    // Instant modification if URL is 'k'
     if (parsed && parsed.prefix === 'k') {
       preemptiveFix(img);
-      
-      // Verify after a short delay
+      // Give it a moment to load, then verify
       setTimeout(() => checkImage(img), 2000);
     }
     
-    // Add error handler
+    // Listen for load errors
     img.addEventListener('error', function() {
-      // Small delay to prevent race conditions
       setTimeout(() => {
         if (img.dataset.batoFixing !== "done") {
           fixImage(img);
         }
       }, 100);
-    }, { once: false }); // Allow multiple error events
+    }, { once: false });
   }
 
-  // 9. Initialize
+  // 9. Initialization and Observers
   function init() {
-    // Process all existing images
+    // Scan existing
     document.querySelectorAll('img').forEach(img => {
       processNewImage(img);
-      // Check existing images after a delay
       setTimeout(() => checkImage(img), 1000);
     });
 
-    // Watch for new images and changes
+    // Scan future (Infinity scroll/Chapters)
     const observer = new MutationObserver((mutations) => {
       mutations.forEach(mutation => {
-        // Handle added nodes
+        // Handle added IMG nodes
         mutation.addedNodes.forEach(node => {
           if (node.tagName === 'IMG') {
             processNewImage(node);
             setTimeout(() => checkImage(node), 1000);
           }
-          
           if (node.querySelectorAll) {
             node.querySelectorAll('img').forEach(img => {
               if (!img.dataset.batoFixing) {
@@ -354,13 +327,13 @@
           }
         });
         
-        // Handle src/srcset changes
+        // Handle attribute changes (src/srcset updates)
         if (mutation.type === 'attributes' && 
             (mutation.attributeName === 'src' || mutation.attributeName === 'srcset') && 
             mutation.target.tagName === 'IMG') {
           
           const img = mutation.target;
-          // Reset fixing status if src changed and not by us
+          // Only react if the change wasn't made by this script
           if (img.dataset.batoFixing !== "done" && !img.dataset.batoFixed) {
             img.dataset.batoFixing = "";
             img.dataset.batoPreemptive = "";
@@ -381,7 +354,7 @@
     });
   }
 
-  // Start the extension
+  // Start
   if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', init);
   } else {
