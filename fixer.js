@@ -15,7 +15,11 @@
   const failedCache = new Set(); // Remembers dead URLs
   const processingImages = new WeakSet();
 
-  // 1. Parse URL structure
+  /**
+   * Parse an image host URL and extract its subdomain-style components.
+   * @param {string} src - The URL or host string to parse (expected to match SUBDOMAIN_RE).
+   * @returns {{prefix: string, number: number, root: string, tld: string, path: string} | null} An object with `prefix` (lowercase), `number` (integer), `root` (lowercase), `tld` (lowercase), and `path` if the input matches the expected pattern, or `null` if it does not.
+   */
   function parseSubdomain(src) {
     const m = src.match(SUBDOMAIN_RE);
     if (!m) return null;
@@ -28,7 +32,12 @@
     };
   }
 
-  // 2. Test if a URL works
+  /**
+   * Probe whether an image URL serves a valid (non-placeholder) image within the given timeout.
+   * @param {string} url - Full URL of the image to probe.
+   * @param {number} [timeout=PROBE_TIMEOUT] - Maximum time in milliseconds to wait before treating the probe as timed out.
+   * @returns {Promise<boolean>} Resolves to `true` when the URL returns an image whose dimensions exceed 1x1. Rejects with one of: `'timeout'`, `'error'`, `'empty'`, or `'cached-fail'`.
+   */
   function probeUrl(url, timeout = PROBE_TIMEOUT) {
     return new Promise((resolve, reject) => {
       // Check simple cache first
@@ -74,7 +83,15 @@
     });
   }
 
-  // 3. Generate candidate URLs (STRICTLY K AND N ONLY)
+  /**
+   * Build a prioritized list of candidate image URLs (only 'k' and 'n' prefixes) to try for a parsed source.
+   *
+   * The list is ordered by priority and deduplicated, then truncated to MAX_ATTEMPTS. Each candidate is an HTTPS URL
+   * of the form `https://<prefix><NN>.<root>.<tld><path>` where the server number is zero-padded to two digits.
+   *
+   * @param {{ prefix: string, number: number, root: string, tld: string, path: string }} parsed - Parsed components of the original image URL.
+   * @returns {string[]} An array of candidate URLs sorted by priority (lower first), unique, and limited to MAX_ATTEMPTS.
+   */
   function generateCandidates(parsed) {
     const candidates = [];
     const pathKey = parsed.path.split('/').slice(0, 3).join('/'); 
@@ -127,7 +144,14 @@
     return [...new Set(sorted)].slice(0, MAX_ATTEMPTS);
   }
 
-  // 4. Update srcset for responsiveness
+  /**
+   * Rewrite srcset entries to use the base derived from a working image URL.
+   *
+   * If `srcset` is falsy or `workingUrl` cannot be parsed by parseSubdomain, returns `null`.
+   * @param {string} srcset - The original srcset attribute value.
+   * @param {string} workingUrl - A URL whose subdomain (prefix + number + root + tld) will be used as the new base.
+   * @returns {string|null} The srcset with matching host patterns replaced by the new base, or `null` when rewrite is not possible.
+   */
   function rewriteSrcset(srcset, workingUrl) {
     if (!srcset) return null;
     const workingParsed = parseSubdomain(workingUrl);
@@ -136,6 +160,14 @@
     return srcset.replace(/https?:\/\/[a-z]+\d{1,3}\.[a-z0-9\-]+\.(org|net|to)/gi, newBase);
   }
   
+  /**
+   * Attempt to repair a broken <img> element by probing generated candidate URLs and applying the first reachable one.
+   *
+   * Tries candidate image URLs derived from the image's current host pattern until a working URL is found or all candidates fail. On success it updates the image's src (and srcset when possible), marks the image as fixed, and caches the working server pattern for future attempts. On repeated timeout failures it schedules a single delayed retry; otherwise it marks the attempt as failed.
+   *
+   * @param {HTMLImageElement} img - The image element to fix; its src and srcset may be modified and dataset flags will be updated.
+   * @param {boolean} [isRetry=false] - Internal flag indicating this call is a scheduled retry to avoid re-scheduling additional retries.
+   */
   async function fixImage(img, isRetry = false) {
     // Prevent duplicate processing
     if (processingImages.has(img)) return;
@@ -215,7 +247,16 @@
     }
   }
 
-  // 6. Fast Fix: Swaps 'k' to 'n' without checking connectivity first
+  /**
+   * Attempt a fast swap of an image's host from a 'k' prefix to an 'n' prefix, preferring a cached working server when available.
+   *
+   * If the image URL does not match the expected subdomain pattern or its prefix is not 'k', no change is made.
+   * When applied, the function updates the image's `src` (and `srcset` when rewrite succeeds), stores originals on `dataset`,
+   * sets `referrerPolicy` to "no-referrer", and marks the image with `dataset.batoPreemptive`.
+   *
+   * @param {HTMLImageElement} img - The image element to modify.
+   * @returns {boolean} `true` if the image `src` was changed to a preemptive 'k'→'n' variant, `false` otherwise.
+   */
   function preemptiveFix(img) {
     const parsed = parseSubdomain(img.src);
     if (!parsed) return false;
@@ -260,7 +301,10 @@
     return true;
   }
 
-  // 7. Verify the preemptive fix
+  /**
+   * Verify whether a preemptive swap fixed a broken image, revert if it failed, and invoke the full repair flow when needed.
+   * @param {HTMLImageElement} img - The image element to inspect and potentially repair. If a prior preemptive swap was attempted and the image remains broken, this function restores the original src/srcset, marks the preemptive attempt as failed, and starts the full fix; otherwise, if the image is complete but has zero width and is not already fixed, it starts the full fix.
+   */
   function checkImage(img) {
     // If preemptive fix failed (still broken), try the full search (fixImage)
     if (img.dataset.batoPreemptive === "true" && img.complete && img.naturalWidth === 0) {
@@ -279,7 +323,12 @@
     }
   }
 
-  // 8. Handle new images added to DOM
+  /**
+   * Handle a newly added <img> element by attempting a fast k→n swap when appropriate and installing an error handler to recover broken images.
+   *
+   * If the image's src matches the subdomain pattern and uses the 'k' prefix, performs a preemptive fix and schedules a verification check after 2000 ms. Attaches an "error" listener that, after 100 ms, invokes the full repair flow unless the image has already been marked fixed.
+   * @param {HTMLImageElement} img - The image element to process.
+   */
   function processNewImage(img) {
     const parsed = parseSubdomain(img.src);
     
@@ -300,7 +349,13 @@
     }, { once: false });
   }
 
-  // 9. Initialization and Observers
+  /**
+   * Initialize image-repair processing for the page by scanning existing images and observing DOM mutations.
+   *
+   * Processes all current IMG elements (scheduling follow-up checks) and installs a MutationObserver that:
+   * - processes newly added IMG elements (and nested IMG elements) and schedules verification checks;
+   * - reacts to src/srcset attribute changes on IMG elements (ignoring changes made by this script) by reprocessing and rechecking the image.
+   */
   function init() {
     // Scan existing
     document.querySelectorAll('img').forEach(img => {
